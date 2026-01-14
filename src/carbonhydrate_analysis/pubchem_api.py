@@ -9,6 +9,7 @@ import requests
 import json
 import time
 from typing import List, Dict, Any, Union, Optional
+from tqdm import tqdm
 from . import config
 from .classification import classify_carbohydrate
 from .utils import extract_ontology_terms_from_node
@@ -278,7 +279,7 @@ class PubChemClient:
         properties_dict = self.get_properties(cids)
         
         # Process each compound
-        for cid in cids:
+        for cid in tqdm(cids, desc="Processing compounds", unit="compound"):
             if cid not in properties_dict:
                 continue
             
