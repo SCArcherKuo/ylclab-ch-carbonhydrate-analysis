@@ -6,7 +6,7 @@ their ChEBI ontology terms and hierarchical relationships.
 """
 
 from typing import List, Any, Tuple, Optional
-from .chebi_api import get_chebi_children, get_main_groups
+from .chebi_api import get_chebi_children, get_main_groups, get_all_ancestors
 from .utils import extract_term_string
 from . import config
 
@@ -190,3 +190,125 @@ def classify_carbohydrate(chebi_ontology: List[Any]) -> Tuple[Optional[str], Opt
         subclass: Specific subclass name or None
     """
     return _default_classifier.classify(chebi_ontology)
+
+
+def classify_by_chebi_ancestry(chebi_id: int) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Classify a compound based on its ChEBI ID ancestry using direct ChEBI API calls.
+    
+    This is more efficient than the PubChem classification method as it directly
+    queries ChEBI and walks up the ontology tree to determine classification.
+    
+    Parameters:
+    -----------
+    chebi_id : int
+        ChEBI ID (without 'CHEBI:' prefix)
+    
+    Returns:
+    --------
+    tuple of (main_class, subclass)
+        main_class: One of ['main carbohydrate group', 'other carbohydrate', 
+                           'main carbohydrate derivative group', 'other carbohydrate derivative', 
+                           'other', None]
+        subclass: Specific subclass name or None
+    
+    Examples:
+    ---------
+    >>> main_class, subclass = classify_by_chebi_ancestry(15365)  # D-glucose
+    >>> print(main_class, subclass)
+    'main carbohydrate group' 'monosaccharide'
+    """
+    # Get all ancestors
+    ancestors = get_all_ancestors(chebi_id)
+    
+    # Check if compound belongs to carbohydrates root (CHEBI:78616)
+    if config.CHEBI_ROOT_ID not in ancestors:
+        return None, None
+    
+    # Get main groups for carbohydrate and carbohydrate derivative
+    carb_main_groups = get_main_groups(config.CHEBI_CARBOHYDRATE_ID)
+    carb_deriv_main_groups = get_main_groups(config.CHEBI_CARBOHYDRATE_DERIVATIVE_ID)
+    
+    # Check if it's a carbohydrate (CHEBI:16646)
+    if config.CHEBI_CARBOHYDRATE_ID in ancestors:
+        return _classify_by_ancestry_path(
+            chebi_id, 
+            ancestors, 
+            config.CHEBI_CARBOHYDRATE_ID,
+            carb_main_groups,
+            'main carbohydrate group',
+            'other carbohydrate'
+        )
+    
+    # Check if it's a carbohydrate derivative (CHEBI:63299)
+    if config.CHEBI_CARBOHYDRATE_DERIVATIVE_ID in ancestors:
+        return _classify_by_ancestry_path(
+            chebi_id,
+            ancestors,
+            config.CHEBI_CARBOHYDRATE_DERIVATIVE_ID,
+            carb_deriv_main_groups,
+            'main carbohydrate derivative group',
+            'other carbohydrate derivative'
+        )
+    
+    # If under root but not in carbohydrate or carbohydrate derivative
+    root_children = get_chebi_children(config.CHEBI_ROOT_ID)
+    for child in root_children:
+        child_id = child.get('init_id')
+        if child_id and child_id in ancestors:
+            return 'other', child.get('init_name', 'carbohydrates and carbohydrate derivatives')
+    
+    return 'other', 'carbohydrates and carbohydrate derivatives'
+
+
+def _classify_by_ancestry_path(
+    chebi_id: int,
+    ancestors: List[int],
+    parent_category_id: int,
+    main_groups: List[str],
+    main_class_label: str,
+    other_class_label: str
+) -> Tuple[str, str]:
+    """
+    Helper function to classify based on ancestry path.
+    
+    Parameters:
+    -----------
+    chebi_id : int
+        ChEBI ID being classified
+    ancestors : list of int
+        List of all ancestor IDs
+    parent_category_id : int
+        ID of the parent category (carbohydrate or carbohydrate derivative)
+    main_groups : list of str
+        List of main group names
+    main_class_label : str
+        Label for main class matches
+    other_class_label : str
+        Label for other category matches
+    
+    Returns:
+    --------
+    tuple of (main_class, subclass)
+    """
+    # Get children of the parent category
+    parent_children = get_chebi_children(parent_category_id)
+    
+    # Build mapping of child_id to child_name
+    child_id_to_name = {child['init_id']: child['init_name'] for child in parent_children}
+    
+    # Find which direct child of parent_category is in the ancestry
+    for ancestor_id in ancestors:
+        if ancestor_id in child_id_to_name:
+            child_name = child_id_to_name[ancestor_id]
+            
+            # Check if this is a main group
+            if child_name in main_groups:
+                return main_class_label, child_name
+            else:
+                return other_class_label, child_name
+    
+    # Fallback to parent category name
+    parent_name = 'carbohydrate' if parent_category_id == config.CHEBI_CARBOHYDRATE_ID else 'carbohydrate derivative'
+    return other_class_label, parent_name
+

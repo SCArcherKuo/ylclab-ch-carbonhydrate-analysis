@@ -8,10 +8,11 @@ compound information, properties, classifications, and synonyms.
 import requests
 import json
 import time
+import re
 from typing import List, Dict, Any, Union, Optional
 from tqdm import tqdm
 from . import config
-from .classification import classify_carbohydrate
+from .classification import classify_carbohydrate, classify_by_chebi_ancestry
 from .utils import extract_ontology_terms_from_node
 
 
@@ -222,6 +223,45 @@ class PubChemClient:
         
         return []
     
+    def extract_chebi_id_from_synonyms(self, synonyms: List[str]) -> Optional[int]:
+        """
+        Extract ChEBI ID from synonym list.
+        
+        Parameters:
+        -----------
+        synonyms : list of str
+            List of compound synonyms
+        
+        Returns:
+        --------
+        int or None
+            ChEBI ID (without 'CHEBI:' prefix) if found, None otherwise
+        
+        Examples:
+        ---------
+        >>> client = PubChemClient()
+        >>> synonyms = ['glucose', 'CHEBI:15365', 'D-glucose']
+        >>> chebi_id = client.extract_chebi_id_from_synonyms(synonyms)
+        >>> print(chebi_id)
+        15365
+        """
+        # Pattern to match CHEBI:##### format
+        chebi_pattern = re.compile(r'^CHEBI[:\s]+(\d+)$', re.IGNORECASE)
+        
+        for synonym in synonyms:
+            if not isinstance(synonym, str):
+                continue
+            
+            synonym = synonym.strip()
+            match = chebi_pattern.match(synonym)
+            if match:
+                try:
+                    return int(match.group(1))
+                except ValueError:
+                    continue
+        
+        return None
+    
     def extract_chebi_ontology(self, classifications: List[Dict[str, Any]]) -> List[Any]:
         """
         Extract ChEBI ontology terms from classifications.
@@ -261,6 +301,9 @@ class PubChemClient:
         """
         Get complete compound information for multiple CIDs.
         
+        Uses efficient ChEBI ancestry-based classification when possible,
+        falling back to PubChem classification if needed.
+        
         Parameters:
         -----------
         cids : list of int
@@ -285,19 +328,31 @@ class PubChemClient:
             
             props = properties_dict[cid]
             
-            # Get classification
-            time.sleep(self.rate_limit_delay)
-            classifications = self.get_classification(cid)
-            
-            # Get synonyms
+            # Try efficient ChEBI-based classification first
             time.sleep(self.rate_limit_delay)
             synonyms = self.get_synonyms(cid)
+            chebi_id = self.extract_chebi_id_from_synonyms(synonyms)
             
-            # Extract ChEBI ontology
-            chebi_ontology = self.extract_chebi_ontology(classifications)
+            main_class = None
+            subclass = None
+            classifications = []
+            chebi_ontology = []
             
-            # Classify carbohydrate
-            main_class, subclass = classify_carbohydrate(chebi_ontology)
+            if chebi_id:
+                # Use efficient ancestry-based classification
+                try:
+                    main_class, subclass = classify_by_chebi_ancestry(chebi_id)
+                except Exception as e:
+                    print(f"Warning: ChEBI ancestry classification failed for CID {cid} (ChEBI:{chebi_id}): {str(e)}")
+                    chebi_id = None  # Force fallback
+            
+            # Fallback to PubChem classification if no ChEBI ID or classification failed
+            if not chebi_id or main_class is None:
+                time.sleep(self.rate_limit_delay)
+                classifications = self.get_classification(cid)
+                chebi_ontology = self.extract_chebi_ontology(classifications)
+                main_class, subclass = classify_carbohydrate(chebi_ontology)
+            
             is_carbohydrate = main_class is not None
             
             # Compile result
@@ -309,9 +364,9 @@ class PubChemClient:
                 'inchi': props.get('InChI'),
                 'inchikey': props.get('InChIKey'),
                 'smiles': props.get('CanonicalSMILES'),
+                'chebi_id': chebi_id,
                 'classifications': classifications,
                 'chebi_ontology': chebi_ontology,
-                'synonyms': synonyms[:self.max_synonyms],
                 'is_carbohydrate': is_carbohydrate,
                 'carbohydrate_main_class': main_class,
                 'carbohydrate_subclass': subclass
@@ -361,9 +416,9 @@ def get_compound_info_pubchem(
         - inchi: InChI string
         - inchikey: InChIKey
         - smiles: Canonical SMILES
-        - classifications: List of chemical classification hierarchies
-        - chebi_ontology: ChEBI ontology terms extracted from classifications
-        - synonyms: List of compound synonyms (max 20)
+        - chebi_id: ChEBI ID (int) if found in synonyms, None otherwise
+        - classifications: List of chemical classification hierarchies (empty if ChEBI method used)
+        - chebi_ontology: ChEBI ontology terms extracted from classifications (empty if ChEBI method used)
         - is_carbohydrate: Boolean flag (True if compound belongs to CHEBI:78616)
         - carbohydrate_main_class: Main classification category (5 categories or None)
         - carbohydrate_subclass: Subclass name or None

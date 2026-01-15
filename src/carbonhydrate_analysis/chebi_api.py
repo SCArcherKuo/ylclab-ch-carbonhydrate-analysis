@@ -13,6 +13,8 @@ from . import config
 
 # Cache for ChEBI API responses to avoid repeated calls
 _chebi_children_cache: Dict[int, List[Dict[str, Any]]] = {}
+_chebi_parents_cache: Dict[int, List[Dict[str, Any]]] = {}
+_chebi_ancestors_cache: Dict[int, List[int]] = {}
 
 
 class ChEBIClient:
@@ -53,9 +55,13 @@ class ChEBIClient:
             self.cache_dir = project_root / 'data' / 'cache'
         
         self.cache_file = self.cache_dir / 'chebi_children_cache.json'
+        self.parents_cache_file = self.cache_dir / 'chebi_parents_cache.json'
+        self.ancestors_cache_file = self.cache_dir / 'chebi_ancestors_cache.json'
         
-        # Use global cache for backward compatibility
+        # Use global caches for backward compatibility
         self.cache = _chebi_children_cache
+        self.parents_cache = _chebi_parents_cache
+        self.ancestors_cache = _chebi_ancestors_cache
         
         # Track if cache has been modified
         self._cache_dirty = False
@@ -65,6 +71,8 @@ class ChEBIClient:
         # Load persistent cache if enabled
         if self.use_cache:
             self._load_cache()
+            self._load_parents_cache()
+            self._load_ancestors_cache()
     
     def get_children(self, chebi_id: int) -> List[Dict[str, Any]]:
         """
@@ -122,6 +130,120 @@ class ChEBIClient:
             self.cache[chebi_id] = []
             self._cache_dirty = True
             return []
+    
+    def get_parents(self, chebi_id: int) -> List[Dict[str, Any]]:
+        """
+        Get direct parents of a ChEBI ID from ChEBI backend API.
+        
+        Parameters:
+        -----------
+        chebi_id : int
+            ChEBI ID (without 'CHEBI:' prefix)
+        
+        Returns:
+        --------
+        list of dict
+            List of direct parents with 'is a' relationship.
+            Each dict contains: 'init_id', 'init_name', 'relation_type', 'final_id', 'final_name'
+        
+        Examples:
+        ---------
+        >>> client = ChEBIClient()
+        >>> parents = client.get_parents(4167)  # D-glucopyranose
+        >>> print(parents)
+        """
+        # Check cache first
+        if chebi_id in self.parents_cache:
+            return self.parents_cache[chebi_id]
+        
+        try:
+            url = f'{self.base_url}/ontology/parents/{chebi_id}/'
+            response = requests.get(url, headers={'accept': '*/*'}, timeout=self.timeout)
+            
+            if response.status_code != 200:
+                print(f"Warning: ChEBI API failed for {chebi_id}: HTTP {response.status_code}")
+                self.parents_cache[chebi_id] = []
+                return []
+            
+            data = response.json()
+            outgoing = data.get('ontology_relations', {}).get('outgoing_relations', [])
+            
+            # Filter for "is a" relations (direct parents)
+            parents = [rel for rel in outgoing if rel.get('relation_type') == 'is a']
+            
+            self.parents_cache[chebi_id] = parents
+            self._cache_dirty = True
+            self._cache_save_counter += 1
+            
+            # Save cache periodically (batch saves)
+            if self.use_cache and self._cache_save_counter >= self._save_batch_size:
+                self._save_cache()
+                self._save_parents_cache()
+                self._cache_save_counter = 0
+            
+            return parents
+            
+        except Exception as e:
+            print(f"Warning: Error fetching ChEBI parents for {chebi_id}: {str(e)}")
+            self.parents_cache[chebi_id] = []
+            self._cache_dirty = True
+            return []
+    
+    def get_all_ancestors(self, chebi_id: int, max_depth: int = 20) -> List[int]:
+        """
+        Get all ancestor ChEBI IDs by recursively traversing parent relationships.
+        
+        Parameters:
+        -----------
+        chebi_id : int
+            Starting ChEBI ID (without 'CHEBI:' prefix)
+        max_depth : int, optional
+            Maximum recursion depth to prevent infinite loops (default: 20)
+        
+        Returns:
+        --------
+        list of int
+            List of all ancestor ChEBI IDs (includes the starting ID)
+        
+        Examples:
+        ---------
+        >>> client = ChEBIClient()
+        >>> ancestors = client.get_all_ancestors(4167)  # D-glucopyranose
+        >>> print(16646 in ancestors)  # Check if carbohydrate ancestor
+        True
+        """
+        # Check cache first
+        if chebi_id in self.ancestors_cache:
+            return self.ancestors_cache[chebi_id]
+        
+        ancestors = set([chebi_id])  # Include self
+        visited = set()
+        queue = [chebi_id]
+        depth = 0
+        
+        while queue and depth < max_depth:
+            current_batch = queue[:]
+            queue = []
+            
+            for current_id in current_batch:
+                if current_id in visited:
+                    continue
+                visited.add(current_id)
+                
+                parents = self.get_parents(current_id)
+                for parent_rel in parents:
+                    parent_id = parent_rel.get('final_id')
+                    if parent_id and parent_id not in ancestors:
+                        ancestors.add(parent_id)
+                        queue.append(parent_id)
+            
+            depth += 1
+        
+        ancestor_list = sorted(list(ancestors))
+        self.ancestors_cache[chebi_id] = ancestor_list
+        self._cache_dirty = True
+        
+        return ancestor_list
     
     def get_main_groups(self, chebi_id: int) -> List[str]:
         """
@@ -183,9 +305,43 @@ class ChEBIClient:
             for key_str, value in cache_data.items():
                 self.cache[int(key_str)] = value
             
-            print(f"Loaded ChEBI cache with {len(self.cache)} entries from {self.cache_file}")
+            print(f"Loaded ChEBI children cache with {len(self.cache)} entries")
         except Exception as e:
-            print(f"Warning: Failed to load ChEBI cache: {str(e)}")
+            print(f"Warning: Failed to load ChEBI children cache: {str(e)}")
+    
+    def _load_parents_cache(self) -> None:
+        """Load parents cache from disk if it exists."""
+        if not self.parents_cache_file.exists():
+            return
+        
+        try:
+            with open(self.parents_cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+            
+            # Convert string keys back to integers
+            for key_str, value in cache_data.items():
+                self.parents_cache[int(key_str)] = value
+            
+            print(f"Loaded ChEBI parents cache with {len(self.parents_cache)} entries")
+        except Exception as e:
+            print(f"Warning: Failed to load ChEBI parents cache: {str(e)}")
+    
+    def _load_ancestors_cache(self) -> None:
+        """Load ancestors cache from disk if it exists."""
+        if not self.ancestors_cache_file.exists():
+            return
+        
+        try:
+            with open(self.ancestors_cache_file, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+            
+            # Convert string keys back to integers
+            for key_str, value in cache_data.items():
+                self.ancestors_cache[int(key_str)] = value
+            
+            print(f"Loaded ChEBI ancestors cache with {len(self.ancestors_cache)} entries")
+        except Exception as e:
+            print(f"Warning: Failed to load ChEBI ancestors cache: {str(e)}")
     
     def _save_cache(self) -> None:
         """
@@ -213,28 +369,68 @@ class ChEBIClient:
             temp_file.replace(self.cache_file)
             
             self._cache_dirty = False
-            print(f"Saved ChEBI cache with {len(self.cache)} entries")
+            print(f"Saved ChEBI children cache with {len(self.cache)} entries")
         except Exception as e:
-            print(f"Warning: Failed to save ChEBI cache: {str(e)}")
+            print(f"Warning: Failed to save ChEBI children cache: {str(e)}")
+    
+    def _save_parents_cache(self) -> None:
+        """Save parents cache to disk in JSON format."""
+        if not self.use_cache or not self._cache_dirty:
+            return
+        
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_data = {str(key): value for key, value in self.parents_cache.items()}
+            
+            temp_file = self.parents_cache_file.with_suffix('.tmp')
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, indent=2, ensure_ascii=False)
+            
+            temp_file.replace(self.parents_cache_file)
+            print(f"Saved ChEBI parents cache with {len(self.parents_cache)} entries")
+        except Exception as e:
+            print(f"Warning: Failed to save ChEBI parents cache: {str(e)}")
+    
+    def _save_ancestors_cache(self) -> None:
+        """Save ancestors cache to disk in JSON format."""
+        if not self.use_cache or not self._cache_dirty:
+            return
+        
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_data = {str(key): value for key, value in self.ancestors_cache.items()}
+            
+            temp_file = self.ancestors_cache_file.with_suffix('.tmp')
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, indent=2, ensure_ascii=False)
+            
+            temp_file.replace(self.ancestors_cache_file)
+            print(f"Saved ChEBI ancestors cache with {len(self.ancestors_cache)} entries")
+        except Exception as e:
+            print(f"Warning: Failed to save ChEBI ancestors cache: {str(e)}")
     
     def save_cache(self) -> None:
         """
-        Manually save the cache to disk.
+        Manually save all caches to disk.
         
         This is called automatically in batches and on cleanup,
         but can be called manually to ensure data is persisted.
         """
         self._save_cache()
+        self._save_parents_cache()
+        self._save_ancestors_cache()
     
     def __del__(self):
         """
-        Destructor to save cache when object is garbage collected.
+        Destructor to save all caches when object is garbage collected.
         
         This ensures that any pending cache updates are saved even
         if save_cache() wasn't called explicitly.
         """
         if self.use_cache and self._cache_dirty:
             self._save_cache()
+            self._save_parents_cache()
+            self._save_ancestors_cache()
 
 
 # =============================================================================
@@ -281,3 +477,41 @@ def get_main_groups(chebi_id: int) -> List[str]:
         List of main group names
     """
     return _default_client.get_main_groups(chebi_id)
+
+
+def get_chebi_parents(chebi_id: int) -> List[Dict[str, Any]]:
+    """
+    Get direct parents of a ChEBI ID from ChEBI backend API.
+    
+    Convenience function that uses the default ChEBI client.
+    
+    Parameters:
+    -----------
+    chebi_id : int
+        ChEBI ID (without 'CHEBI:' prefix)
+    
+    Returns:
+    --------
+    list of dict
+        List of direct parents with 'is a' relationship.
+    """
+    return _default_client.get_parents(chebi_id)
+
+
+def get_all_ancestors(chebi_id: int) -> List[int]:
+    """
+    Get all ancestor ChEBI IDs by recursively traversing parent relationships.
+    
+    Convenience function that uses the default ChEBI client.
+    
+    Parameters:
+    -----------
+    chebi_id : int
+        Starting ChEBI ID (without 'CHEBI:' prefix)
+    
+    Returns:
+    --------
+    list of int
+        List of all ancestor ChEBI IDs (includes the starting ID)
+    """
+    return _default_client.get_all_ancestors(chebi_id)
