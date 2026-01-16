@@ -144,7 +144,9 @@ class ChEBIClient:
         
         # Track if cache has been modified
         self._cache_dirty = False
-        self._cache_save_counter = 0
+        self._children_save_counter = 0
+        self._parents_save_counter = 0
+        self._ancestors_save_counter = 0
         self._save_batch_size = 10  # Save after every N new entries
         
         # Load persistent cache if enabled
@@ -198,12 +200,12 @@ class ChEBIClient:
             
             self.cache[chebi_id] = children
             self._cache_dirty = True
-            self._cache_save_counter += 1
+            self._children_save_counter += 1
             
-            # Save cache periodically (batch saves)
-            if self.use_cache and self._cache_save_counter >= self._save_batch_size:
-                self._save_cache()
-                self._cache_save_counter = 0
+            # Save all caches periodically (batch saves)
+            if self.use_cache and self._children_save_counter >= self._save_batch_size:
+                self.save_cache()  # Save all caches together
+                self._children_save_counter = 0
             
             return children
             
@@ -265,13 +267,12 @@ class ChEBIClient:
             
             self.parents_cache[chebi_id] = parents
             self._cache_dirty = True
-            self._cache_save_counter += 1
+            self._parents_save_counter += 1
             
-            # Save cache periodically (batch saves)
-            if self.use_cache and self._cache_save_counter >= self._save_batch_size:
-                self._save_cache()
-                self._save_parents_cache()
-                self._cache_save_counter = 0
+            # Save all caches periodically (batch saves)
+            if self.use_cache and self._parents_save_counter >= self._save_batch_size:
+                self.save_cache()  # Save all caches together
+                self._parents_save_counter = 0
             
             return parents
             
@@ -345,6 +346,12 @@ class ChEBIClient:
             logger.debug(f"Found {len(ancestor_list)} ancestors for ChEBI {chebi_id}")
             self.ancestors_cache[chebi_id] = ancestor_list
             self._cache_dirty = True
+            self._ancestors_save_counter += 1
+            
+            # Save all caches periodically (batch saves)
+            if self.use_cache and self._ancestors_save_counter >= self._save_batch_size:
+                self.save_cache()  # Save all caches together
+                self._ancestors_save_counter = 0
             
             return ancestor_list
             
@@ -459,13 +466,8 @@ class ChEBIClient:
             print(f"Warning: Failed to load ChEBI ancestors cache: {str(e)}")
     
     def _save_cache(self) -> None:
-        """
-        Save cache to disk in JSON format.
-        
-        Creates the cache directory if it doesn't exist.
-        Converts integer keys to strings for JSON compatibility.
-        """
-        if not self.use_cache or not self._cache_dirty:
+        """Save children cache to disk in JSON format."""
+        if not self.use_cache:
             return
         
         try:
@@ -484,14 +486,13 @@ class ChEBIClient:
             # Atomic rename
             temp_file.replace(self.cache_file)
             
-            self._cache_dirty = False
             print(f"Saved ChEBI children cache with {len(self.cache)} entries")
         except Exception as e:
             print(f"Warning: Failed to save ChEBI children cache: {str(e)}")
     
     def _save_parents_cache(self) -> None:
         """Save parents cache to disk in JSON format."""
-        if not self.use_cache or not self._cache_dirty:
+        if not self.use_cache:
             return
         
         try:
@@ -510,7 +511,7 @@ class ChEBIClient:
     
     def _save_ancestors_cache(self) -> None:
         """Save ancestors cache to disk in JSON format."""
-        if not self.use_cache or not self._cache_dirty:
+        if not self.use_cache:
             return
         
         try:
@@ -537,6 +538,7 @@ class ChEBIClient:
         self._save_cache()
         self._save_parents_cache()
         self._save_ancestors_cache()
+        self._cache_dirty = False  # Reset after saving all caches
     
     def __del__(self):
         """
