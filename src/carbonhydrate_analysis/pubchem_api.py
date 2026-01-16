@@ -626,11 +626,12 @@ class PubChemClient:
                         logger.debug(f"CID {cid}: ChEBI classification result: {main_class}, {subclass}")
                     except Exception as e:
                         logger.error(f"ChEBI ancestry classification failed for CID {cid} (ChEBI:{chebi_id}): {str(e)}")
-                        chebi_id = None  # Force fallback
+                        chebi_id = None  # Force fallback on error
                 
-                # Fallback to PubChem classification if no ChEBI ID or classification failed
-                if not chebi_id or main_class is None:
-                    logger.debug(f"CID {cid}: Falling back to PubChem classification")
+                # Fallback to PubChem classification ONLY if no ChEBI ID found
+                # If ChEBI ID exists but compound is not a carbohydrate, trust that result
+                if not chebi_id:
+                    logger.debug(f"CID {cid}: No ChEBI ID found, falling back to PubChem classification")
                     time.sleep(self.rate_limit_delay)
                     classifications = self.get_classification(cid)
                     chebi_ontology = self.extract_chebi_ontology(classifications)
