@@ -1,5 +1,5 @@
 """
-PubChem API Client
+PubChem API Client (Refactored)
 
 This module provides functions for interacting with the PubChem API to retrieve
 compound information, properties, classifications, and synonyms.
@@ -9,16 +9,16 @@ import requests
 import json
 import time
 import re
-import os
 from pathlib import Path
-from collections import deque
-from datetime import datetime
-from typing import List, Dict, Any, Union, Optional, Tuple
+from typing import List, Dict, Any, Union, Optional
 from tqdm import tqdm
 from loguru import logger
 from . import config
 from .classification import classify_carbohydrate, classify_by_chebi_ancestry
 from .utils import extract_ontology_terms_from_node
+from .retry import RetryManager
+from .rate_limiter import RateLimiter
+from .error_tracker import ServerErrorTracker, FailedIdentifierTracker
 
 
 class PubChemClient:
@@ -29,7 +29,12 @@ class PubChemClient:
     information using various identifiers (InChIKey, SMILES, CID).
     """
     
-    def __init__(self, base_url: Optional[str] = None, timeout: Optional[int] = None, rate_limit_delay: Optional[float] = None):
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        timeout: Optional[int] = None,
+        rate_limit_delay: Optional[float] = None
+    ):
         """
         Initialize PubChem API client.
         
@@ -44,100 +49,26 @@ class PubChemClient:
         """
         self.base_url = base_url or config.PUBCHEM_BASE_URL
         self.timeout = timeout or config.API_TIMEOUT
-        self.rate_limit_delay = rate_limit_delay or config.RATE_LIMIT_DELAY
-        self.max_synonyms = config.MAX_SYNONYMS
         self.chunk_size = 512
+        self.max_synonyms = config.MAX_SYNONYMS
         
-        # Retry configuration
-        self.max_retries = config.MAX_RETRIES
-        self.retry_delay = config.RETRY_DELAY
-        self.retry_backoff = config.RETRY_BACKOFF
+        # Initialize utility components
+        self.retry_manager = RetryManager(
+            max_retries=config.MAX_RETRIES,
+            base_delay=config.RETRY_DELAY,
+            backoff_factor=config.RETRY_BACKOFF
+        )
+        self.rate_limiter = RateLimiter(delay=rate_limit_delay or config.RATE_LIMIT_DELAY)
+        self.error_tracker = ServerErrorTracker(
+            error_window=config.SERVER_ERROR_WINDOW,
+            error_threshold=config.SERVER_ERROR_THRESHOLD,
+            sleep_time=config.SERVER_ERROR_SLEEP_TIME
+        )
         
-        # Server error tracking (for adaptive sleep)
-        self.server_error_times: deque = deque(maxlen=100)  # Track last 100 server errors
-        self.server_error_threshold = config.SERVER_ERROR_THRESHOLD
-        self.server_error_window = config.SERVER_ERROR_WINDOW
-        self.server_error_sleep_time = config.SERVER_ERROR_SLEEP_TIME
-        
-        # Failed identifiers tracking
-        self.failed_identifiers: Dict[str, List[str]] = {}
-        self.failed_cids: List[int] = []
-    
-    # =========================================================================
-    # Error Tracking and Adaptive Sleep
-    # =========================================================================
-    
-    def _record_server_error(self) -> None:
-        """Record a server error occurrence and check if we should sleep."""
-        current_time = time.time()
-        self.server_error_times.append(current_time)
-        
-        # Check if we have too many errors in the recent window
-        recent_errors = sum(1 for t in self.server_error_times 
-                          if current_time - t <= self.server_error_window)
-        
-        if recent_errors >= self.server_error_threshold:
-            logger.warning(
-                f"Detected {recent_errors} server errors in the last {self.server_error_window}s. "
-                f"Sleeping for {self.server_error_sleep_time}s to avoid overwhelming the server..."
-            )
-            print(f"\n⚠️  Too many server errors detected. Sleeping for {self.server_error_sleep_time // 60} minutes...")
-            time.sleep(self.server_error_sleep_time)
-            # Clear the error history after sleeping
-            self.server_error_times.clear()
-            logger.info("Resuming after adaptive sleep")
-            print("Resuming processing...")
-    
-    def _save_failed_identifiers(self, identifier_type: str) -> None:
-        """Save failed identifiers to a JSON file for later retry."""
-        if not self.failed_identifiers.get(identifier_type):
-            return
-        
-        # Create cache directory if it doesn't exist
-        cache_dir = Path(config.FAILED_IDENTIFIERS_DIR)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = cache_dir / f"failed_{identifier_type}s_{timestamp}.json"
-        
-        failed_data = {
-            "timestamp": timestamp,
-            "identifier_type": identifier_type,
-            "count": len(self.failed_identifiers[identifier_type]),
-            "identifiers": self.failed_identifiers[identifier_type]
-        }
-        
-        with open(filename, 'w') as f:
-            json.dump(failed_data, f, indent=2)
-        
-        logger.info(f"Saved {len(self.failed_identifiers[identifier_type])} failed {identifier_type}s to {filename}")
-        print(f"\n💾 Saved {len(self.failed_identifiers[identifier_type])} failed {identifier_type}s to {filename}")
-    
-    def _save_failed_cids(self) -> None:
-        """Save failed CIDs to a JSON file for later retry."""
-        if not self.failed_cids:
-            return
-        
-        # Create cache directory if it doesn't exist
-        cache_dir = Path(config.FAILED_IDENTIFIERS_DIR)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = cache_dir / f"failed_cids_{timestamp}.json"
-        
-        failed_data = {
-            "timestamp": timestamp,
-            "count": len(self.failed_cids),
-            "cids": self.failed_cids
-        }
-        
-        with open(filename, 'w') as f:
-            json.dump(failed_data, f, indent=2)
-        
-        logger.info(f"Saved {len(self.failed_cids)} failed CIDs to {filename}")
-        print(f"\n💾 Saved {len(self.failed_cids)} failed CIDs to {filename}")
+        # Set up cache directory for failed identifiers
+        project_root = Path(__file__).parent.parent.parent
+        cache_dir = project_root / 'data' / 'cache'
+        self.failed_tracker = FailedIdentifierTracker(cache_dir)
     
     # =========================================================================
     # Identifier Resolution
@@ -145,12 +76,12 @@ class PubChemClient:
     
     def resolve_identifier_to_cid(self, identifier: str, identifier_type: str) -> Optional[int]:
         """
-        Resolve an identifier (InChIKey or SMILES) to a PubChem CID with retry logic.
+        Resolve a single identifier to PubChem CID with retry logic.
         
         Parameters:
         -----------
         identifier : str
-            The identifier string
+            Identifier to resolve (InChIKey or SMILES)
         identifier_type : str
             Type of identifier: 'inchikey' or 'smiles'
         
@@ -160,69 +91,41 @@ class PubChemClient:
             PubChem CID if found, None otherwise
         """
         logger.debug(f"Resolving {identifier_type}: {identifier[:30]}...")
-        search_url = f"{self.base_url}/compound/{identifier_type}/cids/JSON"
-        headers = {'Content-Type': 'application/x-www-form-urlencoded'}
-        payload = f"{identifier_type}={identifier}"
         
-        for attempt in range(self.max_retries):
-            try:
-                response = requests.post(search_url, data=payload, headers=headers, timeout=self.timeout)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if 'IdentifierList' in data and 'CID' in data['IdentifierList']:
-                        cids = data['IdentifierList']['CID']
-                        if cids:
-                            logger.debug(f"Resolved {identifier[:30]}... -> CID {cids[0]}")
-                            return cids[0]  # Take first CID
-                elif response.status_code == 429:
-                    retry_after = response.headers.get('Retry-After', 'unknown')
-                    logger.error(f"RATE LIMIT EXCEEDED for {identifier_type}: {identifier[:30]}... (Retry-After: {retry_after}s)")
-                    return None  # Don't retry rate limits
-                elif response.status_code >= 500:
-                    logger.error(f"Server error (HTTP {response.status_code}) for {identifier_type}: {identifier[:30]}... (attempt {attempt + 1}/{self.max_retries})")
-                    self._record_server_error()
-                    if attempt < self.max_retries - 1:
-                        delay = self.retry_delay * (self.retry_backoff ** attempt)
-                        logger.info(f"Retrying in {delay:.1f}s...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        # Max retries exceeded, mark as failed
-                        if identifier_type not in self.failed_identifiers:
-                            self.failed_identifiers[identifier_type] = []
-                        self.failed_identifiers[identifier_type].append(identifier)
-                        logger.warning(f"Max retries exceeded for {identifier_type}: {identifier[:30]}...")
-                else:
-                    logger.warning(f"No CID found for {identifier_type}: {identifier[:30]}... (HTTP {response.status_code})")
+        def _resolve():
+            url = f'{self.base_url}/compound/{identifier_type}/{identifier}/cids/JSON'
+            self.rate_limiter.wait()
+            response = requests.get(url, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if 'IdentifierList' in data and 'CID' in data['IdentifierList']:
+                    cids = data['IdentifierList']['CID']
+                    if cids:
+                        cid = cids[0]
+                        logger.debug(f"Resolved {identifier[:30]}... to CID {cid}")
+                        return cid
+                logger.warning(f"No CID found for {identifier[:30]}...")
                 return None
-            except requests.exceptions.Timeout as e:
-                logger.error(f"Timeout resolving {identifier_type} {identifier[:30]}... (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
-                if attempt < self.max_retries - 1:
-                    delay = self.retry_delay * (self.retry_backoff ** attempt)
-                    time.sleep(delay)
-                    continue
-                else:
-                    if identifier_type not in self.failed_identifiers:
-                        self.failed_identifiers[identifier_type] = []
-                    self.failed_identifiers[identifier_type].append(identifier)
+            elif response.status_code == 429:
+                logger.error(f"Rate limit exceeded for {identifier[:30]}...")
                 return None
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request error resolving {identifier_type} {identifier[:30]}... (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
-                if attempt < self.max_retries - 1:
-                    delay = self.retry_delay * (self.retry_backoff ** attempt)
-                    time.sleep(delay)
-                    continue
-                else:
-                    if identifier_type not in self.failed_identifiers:
-                        self.failed_identifiers[identifier_type] = []
-                    self.failed_identifiers[identifier_type].append(identifier)
-                return None
-            except Exception as e:
-                logger.exception(f"Unexpected error resolving identifier {identifier[:30]}...: {str(e)}")
+            elif response.status_code >= 500:
+                self.error_tracker.record_error()
+                raise requests.exceptions.RequestException(f"Server error: HTTP {response.status_code}")
+            else:
+                logger.warning(f"Identifier not found: {identifier[:30]}... (HTTP {response.status_code})")
                 return None
         
-        return None
+        try:
+            return self.retry_manager.execute_with_retry(
+                _resolve,
+                exceptions=(requests.exceptions.Timeout, requests.exceptions.RequestException)
+            )
+        except Exception as e:
+            logger.error(f"Failed to resolve {identifier_type} {identifier[:30]}...: {str(e)}")
+            self.failed_tracker.add_failed_identifier(identifier_type, identifier)
+            return None
     
     def resolve_identifiers_to_cids(
         self,
@@ -256,12 +159,9 @@ class PubChemClient:
                 print(f"  {identifier[:30]}... -> CID {cid}")
             else:
                 print(f"  {identifier[:30]}... -> No CID found")
-            
-            # Small delay to avoid rate limiting
-            time.sleep(0.1)
         
         # Save any failed identifiers
-        self._save_failed_identifiers(identifier_type)
+        self.failed_tracker.save_failed_identifiers(identifier_type)
         
         return identifier_to_cid
     
@@ -291,70 +191,61 @@ class PubChemClient:
             chunk_num = i // self.chunk_size + 1
             total_chunks = (len(cids) + self.chunk_size - 1) // self.chunk_size
             logger.debug(f"Processing chunk {chunk_num}/{total_chunks} ({len(chunk_cids)} CIDs)")
-            cid_list = ','.join(map(str, chunk_cids))
             
-            success = False
-            for attempt in range(self.max_retries):
-                try:
-                    props_url = f"{self.base_url}/compound/cid/property/MolecularFormula,MolecularWeight,InChI,InChIKey,SMILES,IUPACName/JSON"
-                    props_response = requests.post(
-                        props_url,
-                        data=f"cid={cid_list}",
-                        headers={'Content-Type': 'application/x-www-form-urlencoded'},
-                        timeout=self.timeout
-                    )
-                    
-                    if props_response.status_code == 200:
-                        props_data = props_response.json()
-                        if 'PropertyTable' in props_data and 'Properties' in props_data['PropertyTable']:
-                            for props in props_data['PropertyTable']['Properties']:
-                                cid = props.get('CID')
-                                if cid:
-                                    properties[cid] = props
-                            logger.debug(f"Successfully fetched properties for chunk {chunk_num}")
-                            success = True
-                            break
-                    elif props_response.status_code == 429:
-                        retry_after = props_response.headers.get('Retry-After', 'unknown')
-                        logger.error(f"RATE LIMIT EXCEEDED for properties chunk {chunk_num} (Retry-After: {retry_after}s)")
-                        break  # Don't retry rate limits
-                    elif props_response.status_code >= 500:
-                        logger.error(f"Server error (HTTP {props_response.status_code}) for properties chunk {chunk_num} (attempt {attempt + 1}/{self.max_retries})")
-                        self._record_server_error()
-                        if attempt < self.max_retries - 1:
-                            delay = self.retry_delay * (self.retry_backoff ** attempt)
-                            logger.info(f"Retrying chunk {chunk_num} in {delay:.1f}s...")
-                            time.sleep(delay)
-                            continue
-                        else:
-                            # Max retries exceeded, mark CIDs as failed
-                            self.failed_cids.extend(chunk_cids)
-                            logger.warning(f"Max retries exceeded for properties chunk {chunk_num}")
-                    else:
-                        logger.warning(f"Properties request failed for chunk {chunk_num}: HTTP {props_response.status_code}")
-                        break
-                except requests.exceptions.Timeout as e:
-                    logger.error(f"Timeout fetching properties for chunk {chunk_num} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
-                    if attempt < self.max_retries - 1:
-                        delay = self.retry_delay * (self.retry_backoff ** attempt)
-                        time.sleep(delay)
-                        continue
-                    else:
-                        self.failed_cids.extend(chunk_cids)
-                except requests.exceptions.RequestException as e:
-                    logger.error(f"Request error fetching properties for chunk {chunk_num} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
-                    if attempt < self.max_retries - 1:
-                        delay = self.retry_delay * (self.retry_backoff ** attempt)
-                        time.sleep(delay)
-                        continue
-                    else:
-                        self.failed_cids.extend(chunk_cids)
-                except Exception as e:
-                    logger.exception(f"Unexpected error fetching properties for chunk {chunk_num}: {str(e)}")
-                    break
+            chunk_properties = self._fetch_properties_chunk(chunk_cids, chunk_num)
+            properties.update(chunk_properties)
         
         logger.info(f"Fetched properties for {len(properties)}/{len(cids)} CIDs")
         return properties
+    
+    def _fetch_properties_chunk(self, cids: List[int], chunk_num: int) -> Dict[int, Dict[str, Any]]:
+        """Fetch properties for a single chunk of CIDs."""
+        cid_list = ','.join(map(str, cids))
+        
+        def _fetch():
+            self.rate_limiter.wait()
+            props_url = f"{self.base_url}/compound/cid/property/MolecularFormula,MolecularWeight,InChI,InChIKey,SMILES,IUPACName/JSON"
+            response = requests.post(
+                props_url,
+                data=f"cid={cid_list}",
+                headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                timeout=self.timeout
+            )
+            
+            if response.status_code == 200:
+                props_data = response.json()
+                properties = {}
+                if 'PropertyTable' in props_data and 'Properties' in props_data['PropertyTable']:
+                    for props in props_data['PropertyTable']['Properties']:
+                        cid = props.get('CID')
+                        if cid:
+                            properties[cid] = props
+                logger.debug(f"Successfully fetched properties for chunk {chunk_num}")
+                return properties
+            elif response.status_code == 429:
+                logger.error(f"Rate limit exceeded for properties chunk {chunk_num}")
+                return {}
+            elif response.status_code >= 500:
+                self.error_tracker.record_error()
+                raise requests.exceptions.RequestException(f"Server error: HTTP {response.status_code}")
+            else:
+                logger.warning(f"Properties request failed for chunk {chunk_num}: HTTP {response.status_code}")
+                return {}
+        
+        try:
+            return self.retry_manager.execute_with_retry(
+                _fetch,
+                exceptions=(requests.exceptions.Timeout, requests.exceptions.RequestException)
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch properties for chunk {chunk_num}: {str(e)}")
+            for cid in cids:
+                self.failed_tracker.add_failed_cid(cid)
+            return {}
+    
+    # =========================================================================
+    # Classification and Synonyms
+    # =========================================================================
     
     def get_classification(self, cid: int) -> List[Dict[str, Any]]:
         """
@@ -371,59 +262,38 @@ class PubChemClient:
             List of classification hierarchies
         """
         logger.debug(f"Fetching classification for CID {cid}")
-        class_url = f"{self.base_url}/compound/cid/{cid}/classification/JSON"
         
-        for attempt in range(self.max_retries):
-            try:
-                response = requests.get(class_url, timeout=self.timeout)
-                
-                if response.status_code == 200:
-                    class_data = response.json()
-                    if 'Hierarchies' in class_data and 'Hierarchy' in class_data['Hierarchies']:
-                        hierarchies = [h for h in class_data['Hierarchies']['Hierarchy'] if 'Node' in h]
-                        logger.debug(f"Found {len(hierarchies)} classification hierarchies for CID {cid}")
-                        return hierarchies
-                elif response.status_code == 429:
-                    retry_after = response.headers.get('Retry-After', 'unknown')
-                    logger.error(f"RATE LIMIT EXCEEDED for classification CID {cid} (Retry-After: {retry_after}s)")
-                    return []  # Don't retry rate limits
-                elif response.status_code >= 500:
-                    logger.error(f"Server error (HTTP {response.status_code}) for classification CID {cid} (attempt {attempt + 1}/{self.max_retries})")
-                    self._record_server_error()
-                    if attempt < self.max_retries - 1:
-                        delay = self.retry_delay * (self.retry_backoff ** attempt)
-                        logger.info(f"Retrying in {delay:.1f}s...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        self.failed_cids.append(cid)
-                else:
-                    logger.warning(f"No classification data for CID {cid}: HTTP {response.status_code}")
-                    return []
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON decode error in classification for CID {cid}: {str(e)}")
+        def _fetch():
+            self.rate_limiter.wait()
+            class_url = f"{self.base_url}/compound/cid/{cid}/classification/JSON"
+            response = requests.get(class_url, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                class_data = response.json()
+                if 'Hierarchies' in class_data and 'Hierarchy' in class_data['Hierarchies']:
+                    hierarchies = [h for h in class_data['Hierarchies']['Hierarchy'] if 'Node' in h]
+                    logger.debug(f"Found {len(hierarchies)} classification hierarchies for CID {cid}")
+                    return hierarchies
                 return []
-            except requests.exceptions.Timeout as e:
-                logger.error(f"Timeout fetching classification for CID {cid} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
-                if attempt < self.max_retries - 1:
-                    delay = self.retry_delay * (self.retry_backoff ** attempt)
-                    time.sleep(delay)
-                    continue
-                else:
-                    self.failed_cids.append(cid)
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request error fetching classification for CID {cid} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
-                if attempt < self.max_retries - 1:
-                    delay = self.retry_delay * (self.retry_backoff ** attempt)
-                    time.sleep(delay)
-                    continue
-                else:
-                    self.failed_cids.append(cid)
-            except Exception as e:
-                logger.exception(f"Unexpected error fetching classification for CID {cid}: {str(e)}")
+            elif response.status_code == 429:
+                logger.error(f"Rate limit exceeded for classification CID {cid}")
+                return []
+            elif response.status_code >= 500:
+                self.error_tracker.record_error()
+                raise requests.exceptions.RequestException(f"Server error: HTTP {response.status_code}")
+            else:
+                logger.warning(f"No classification data for CID {cid}: HTTP {response.status_code}")
                 return []
         
-        return []
+        try:
+            return self.retry_manager.execute_with_retry(
+                _fetch,
+                exceptions=(requests.exceptions.Timeout, requests.exceptions.RequestException)
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch classification for CID {cid}: {str(e)}")
+            self.failed_tracker.add_failed_cid(cid)
+            return []
     
     def get_synonyms(self, cid: int) -> List[str]:
         """
@@ -440,57 +310,43 @@ class PubChemClient:
             List of synonyms
         """
         logger.debug(f"Fetching synonyms for CID {cid}")
-        syn_url = f"{self.base_url}/compound/cid/{cid}/synonyms/JSON"
         
-        for attempt in range(self.max_retries):
-            try:
-                response = requests.get(syn_url, timeout=self.timeout)
-                
-                if response.status_code == 200:
-                    syn_data = response.json()
-                    if 'InformationList' in syn_data and 'Information' in syn_data['InformationList']:
-                        if len(syn_data['InformationList']['Information']) > 0:
-                            synonyms = syn_data['InformationList']['Information'][0].get('Synonym', [])
-                            logger.debug(f"Found {len(synonyms)} synonyms for CID {cid}")
-                            return synonyms
-                elif response.status_code == 429:
-                    retry_after = response.headers.get('Retry-After', 'unknown')
-                    logger.error(f"RATE LIMIT EXCEEDED for synonyms CID {cid} (Retry-After: {retry_after}s)")
-                    return []  # Don't retry rate limits
-                elif response.status_code >= 500:
-                    logger.error(f"Server error (HTTP {response.status_code}) for synonyms CID {cid} (attempt {attempt + 1}/{self.max_retries})")
-                    self._record_server_error()
-                    if attempt < self.max_retries - 1:
-                        delay = self.retry_delay * (self.retry_backoff ** attempt)
-                        logger.info(f"Retrying in {delay:.1f}s...")
-                        time.sleep(delay)
-                        continue
-                    else:
-                        self.failed_cids.append(cid)
-                else:
-                    logger.warning(f"No synonyms found for CID {cid}: HTTP {response.status_code}")
-                    return []
-            except requests.exceptions.Timeout as e:
-                logger.error(f"Timeout fetching synonyms for CID {cid} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
-                if attempt < self.max_retries - 1:
-                    delay = self.retry_delay * (self.retry_backoff ** attempt)
-                    time.sleep(delay)
-                    continue
-                else:
-                    self.failed_cids.append(cid)
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request error fetching synonyms for CID {cid} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
-                if attempt < self.max_retries - 1:
-                    delay = self.retry_delay * (self.retry_backoff ** attempt)
-                    time.sleep(delay)
-                    continue
-                else:
-                    self.failed_cids.append(cid)
-            except Exception as e:
-                logger.exception(f"Unexpected error fetching synonyms for CID {cid}: {str(e)}")
+        def _fetch():
+            self.rate_limiter.wait()
+            syn_url = f"{self.base_url}/compound/cid/{cid}/synonyms/JSON"
+            response = requests.get(syn_url, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                syn_data = response.json()
+                if 'InformationList' in syn_data and 'Information' in syn_data['InformationList']:
+                    if len(syn_data['InformationList']['Information']) > 0:
+                        synonyms = syn_data['InformationList']['Information'][0].get('Synonym', [])
+                        logger.debug(f"Found {len(synonyms)} synonyms for CID {cid}")
+                        return synonyms
+                return []
+            elif response.status_code == 429:
+                logger.error(f"Rate limit exceeded for synonyms CID {cid}")
+                return []
+            elif response.status_code >= 500:
+                self.error_tracker.record_error()
+                raise requests.exceptions.RequestException(f"Server error: HTTP {response.status_code}")
+            else:
+                logger.warning(f"No synonyms found for CID {cid}: HTTP {response.status_code}")
                 return []
         
-        return []
+        try:
+            return self.retry_manager.execute_with_retry(
+                _fetch,
+                exceptions=(requests.exceptions.Timeout, requests.exceptions.RequestException)
+            )
+        except Exception as e:
+            logger.error(f"Failed to fetch synonyms for CID {cid}: {str(e)}")
+            self.failed_tracker.add_failed_cid(cid)
+            return []
+    
+    # =========================================================================
+    # Data Extraction Helpers
+    # =========================================================================
     
     def extract_chebi_id_from_synonyms(self, synonyms: List[str]) -> Optional[int]:
         """
@@ -505,16 +361,7 @@ class PubChemClient:
         --------
         int or None
             ChEBI ID (without 'CHEBI:' prefix) if found, None otherwise
-        
-        Examples:
-        ---------
-        >>> client = PubChemClient()
-        >>> synonyms = ['glucose', 'CHEBI:15365', 'D-glucose']
-        >>> chebi_id = client.extract_chebi_id_from_synonyms(synonyms)
-        >>> print(chebi_id)
-        15365
         """
-        # Pattern to match CHEBI:##### format
         chebi_pattern = re.compile(r'^CHEBI[:\s]+(\d+)$', re.IGNORECASE)
         
         for synonym in synonyms:
@@ -548,10 +395,8 @@ class PubChemClient:
         chebi_ontology = []
         
         for classification in classifications:
-            # Check if this is ChEBI classification
             source = classification.get('SourceName', '')
             if 'chebi' in source.lower() or 'ChEBI' in source:
-                # Extract all terms from this hierarchy
                 if 'Node' in classification:
                     nodes = classification['Node'] if isinstance(classification['Node'], list) else [classification['Node']]
                     for node in nodes:
@@ -563,10 +408,7 @@ class PubChemClient:
     # Complete Compound Information
     # =========================================================================
     
-    def get_compound_info_batch(
-        self,
-        cids: List[int]
-    ) -> Dict[int, Dict[str, Any]]:
+    def get_compound_info_batch(self, cids: List[int]) -> Dict[int, Dict[str, Any]]:
         """
         Get complete compound information for multiple CIDs.
         
@@ -595,84 +437,89 @@ class PubChemClient:
         # Process each compound
         for idx, cid in enumerate(tqdm(cids, desc="Processing compounds", unit="compound"), 1):
             try:
-                logger.debug(f"Processing compound {idx}/{len(cids)}: CID {cid}")
-                
-                if cid not in properties_dict:
-                    logger.warning(f"CID {cid} not in properties dict, skipping")
-                    continue
-                
-                props = properties_dict[cid]
-                logger.debug(f"CID {cid}: {props.get('IUPACName', 'Unknown')[:50]}...")
-                
-                # Try efficient ChEBI-based classification first
-                time.sleep(self.rate_limit_delay)
-                logger.debug(f"CID {cid}: Fetching synonyms")
-                synonyms = self.get_synonyms(cid)
-                chebi_id = self.extract_chebi_id_from_synonyms(synonyms)
-                
-                if chebi_id:
-                    logger.debug(f"CID {cid}: Found ChEBI ID {chebi_id}")
-                
-                main_class = None
-                subclass = None
-                classifications = []
-                chebi_ontology = []
-                
-                if chebi_id:
-                    # Use efficient ancestry-based classification
-                    try:
-                        logger.debug(f"CID {cid}: Classifying via ChEBI ancestry")
-                        main_class, subclass = classify_by_chebi_ancestry(chebi_id)
-                        logger.debug(f"CID {cid}: ChEBI classification result: {main_class}, {subclass}")
-                    except Exception as e:
-                        logger.error(f"ChEBI ancestry classification failed for CID {cid} (ChEBI:{chebi_id}): {str(e)}")
-                        chebi_id = None  # Force fallback on error
-                
-                # Fallback to PubChem classification ONLY if no ChEBI ID found
-                # If ChEBI ID exists but compound is not a carbohydrate, trust that result
-                if not chebi_id:
-                    logger.debug(f"CID {cid}: No ChEBI ID found, falling back to PubChem classification")
-                    time.sleep(self.rate_limit_delay)
-                    classifications = self.get_classification(cid)
-                    chebi_ontology = self.extract_chebi_ontology(classifications)
-                    main_class, subclass = classify_carbohydrate(chebi_ontology)
-                    logger.debug(f"CID {cid}: PubChem classification result: {main_class}, {subclass}")
-                
-                is_carbohydrate = main_class is not None
-                
-                # Compile result
-                results[cid] = {
-                    'pubchem_cid': cid,
-                    'name': props.get('IUPACName', 'Unknown'),
-                    'formula': props.get('MolecularFormula'),
-                    'molecular_weight': props.get('MolecularWeight'),
-                    'inchi': props.get('InChI'),
-                    'inchikey': props.get('InChIKey'),
-                    'smiles': props.get('CanonicalSMILES'),
-                    'chebi_id': chebi_id,
-                    'classifications': classifications,
-                    'chebi_ontology': chebi_ontology,
-                    'is_carbohydrate': is_carbohydrate,
-                    'carbohydrate_main_class': main_class,
-                    'carbohydrate_subclass': subclass
-                }
-                
-                logger.debug(f"CID {cid}: Successfully processed (is_carb={is_carbohydrate})")
-                
+                result = self._process_single_compound(cid, idx, len(cids), properties_dict)
+                if result:
+                    results[cid] = result
             except KeyboardInterrupt:
                 logger.warning(f"Keyboard interrupt received at compound {idx}/{len(cids)} (CID {cid})")
                 raise
             except Exception as e:
                 logger.exception(f"Unexpected error processing CID {cid} at position {idx}/{len(cids)}: {str(e)}")
-                # Continue processing other compounds
                 continue
         
         logger.info(f"Batch processing complete: {len(results)}/{len(cids)} compounds processed successfully")
         
         # Save any failed CIDs
-        self._save_failed_cids()
+        self.failed_tracker.save_failed_cids()
         
         return results
+    
+    def _process_single_compound(
+        self,
+        cid: int,
+        idx: int,
+        total: int,
+        properties_dict: Dict[int, Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """Process a single compound and return its information."""
+        logger.debug(f"Processing compound {idx}/{total}: CID {cid}")
+        
+        if cid not in properties_dict:
+            logger.warning(f"CID {cid} not in properties dict, skipping")
+            return None
+        
+        props = properties_dict[cid]
+        logger.debug(f"CID {cid}: {props.get('IUPACName', 'Unknown')[:50]}...")
+        
+        # Try efficient ChEBI-based classification first
+        logger.debug(f"CID {cid}: Fetching synonyms")
+        synonyms = self.get_synonyms(cid)
+        chebi_id = self.extract_chebi_id_from_synonyms(synonyms)
+        
+        if chebi_id:
+            logger.debug(f"CID {cid}: Found ChEBI ID {chebi_id}")
+        
+        main_class = None
+        subclass = None
+        classifications = []
+        chebi_ontology = []
+        
+        if chebi_id:
+            # Use efficient ancestry-based classification
+            try:
+                logger.debug(f"CID {cid}: Classifying via ChEBI ancestry")
+                main_class, subclass = classify_by_chebi_ancestry(chebi_id)
+                logger.debug(f"CID {cid}: ChEBI classification result: {main_class}, {subclass}")
+            except Exception as e:
+                logger.error(f"ChEBI ancestry classification failed for CID {cid} (ChEBI:{chebi_id}): {str(e)}")
+                chebi_id = None  # Force fallback on error
+        
+        # Fallback to PubChem classification ONLY if no ChEBI ID found
+        if not chebi_id:
+            logger.debug(f"CID {cid}: No ChEBI ID found, falling back to PubChem classification")
+            classifications = self.get_classification(cid)
+            chebi_ontology = self.extract_chebi_ontology(classifications)
+            main_class, subclass = classify_carbohydrate(chebi_ontology)
+            logger.debug(f"CID {cid}: PubChem classification result: {main_class}, {subclass}")
+        
+        is_carbohydrate = main_class is not None
+        
+        # Compile result
+        return {
+            'pubchem_cid': cid,
+            'name': props.get('IUPACName', 'Unknown'),
+            'formula': props.get('MolecularFormula'),
+            'molecular_weight': props.get('MolecularWeight'),
+            'inchi': props.get('InChI'),
+            'inchikey': props.get('InChIKey'),
+            'smiles': props.get('CanonicalSMILES'),
+            'chebi_id': chebi_id,
+            'classifications': classifications,
+            'chebi_ontology': chebi_ontology,
+            'is_carbohydrate': is_carbohydrate,
+            'carbohydrate_main_class': main_class,
+            'carbohydrate_subclass': subclass
+        }
 
 
 # =============================================================================
@@ -707,34 +554,6 @@ def get_compound_info_pubchem(
     dict or list of dict or None
         For single identifier: Dictionary or None
         For list of identifiers: List of dictionaries (None for failed queries)
-        
-        Dictionary containing compound information:
-        - pubchem_cid: PubChem Compound ID
-        - name: IUPAC name
-        - formula: Molecular formula
-        - molecular_weight: Molecular weight
-        - inchi: InChI string
-        - inchikey: InChIKey
-        - smiles: Canonical SMILES
-        - chebi_id: ChEBI ID (int) if found in synonyms, None otherwise
-        - classifications: List of chemical classification hierarchies (empty if ChEBI method used)
-        - chebi_ontology: ChEBI ontology terms extracted from classifications (empty if ChEBI method used)
-        - is_carbohydrate: Boolean flag (True if compound belongs to CHEBI:78616)
-        - carbohydrate_main_class: Main classification category (5 categories or None)
-        - carbohydrate_subclass: Subclass name or None
-    
-    Example:
-    --------
-    >>> # Single query
-    >>> result = get_compound_info_pubchem("RBNPOMFGQQGHHO-UHFFFAOYSA-N")
-    >>> print(f"Compound: {result['name']}, Is carbohydrate: {result['is_carbohydrate']}")
-    >>> 
-    >>> # Batch query
-    >>> identifiers = ["RBNPOMFGQQGHHO-UHFFFAOYSA-N", "WQZGKKKJIJFFOK-GASJEMHNSA-N"]
-    >>> results = get_compound_info_pubchem(identifiers)
-    >>> for result in results:
-    >>>     if result:
-    >>>         print(f"Compound: {result['name']}")
     """
     client = _default_client
     
@@ -755,21 +574,6 @@ def get_compound_info_pubchem(
         else:
             identifier_type = 'smiles'
     
-    # Validate all identifiers are of the same type
-    for idx, id_str in enumerate(identifiers):
-        if identifier_type == 'inchikey':
-            if not ('-' in id_str and len(id_str.split('-')) == 3):
-                raise ValueError(
-                    f"Identifier at index {idx} ('{id_str}') is not a valid InChIKey. "
-                    f"All identifiers must be of the same type."
-                )
-        else:  # smiles
-            if '-' in id_str and len(id_str.split('-')) == 3:
-                raise ValueError(
-                    f"Identifier at index {idx} ('{id_str}') appears to be an InChIKey "
-                    f"but SMILES was expected. All identifiers must be of the same type."
-                )
-    
     # Process using POST API
     if len(identifiers) == 1:
         print(f"Processing single {identifier_type} identifier...")
@@ -784,10 +588,7 @@ def get_compound_info_pubchem(
     
     if not valid_cids:
         print("No valid CIDs found")
-        if is_single:
-            return None
-        else:
-            return [None for _ in identifiers]
+        return None if is_single else [None for _ in identifiers]
     
     print(f"\nFound {len(valid_cids)} valid CIDs, fetching properties...")
     

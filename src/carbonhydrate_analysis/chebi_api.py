@@ -6,94 +6,12 @@ Biological Interest) API to retrieve ontology information about chemical compoun
 """
 
 import requests
-import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from collections import OrderedDict
 from loguru import logger
 from . import config
-
-
-class LRUCache:
-    """
-    Least Recently Used (LRU) cache with maximum size limit.
-    
-    Automatically evicts least recently used items when cache is full.
-    This prevents unbounded memory growth during long-running processes.
-    """
-    
-    def __init__(self, max_size: int = 200):
-        """
-        Initialize LRU cache.
-        
-        Parameters:
-        -----------
-        max_size : int
-            Maximum number of items to keep in cache (default: 200)
-        """
-        self.cache = OrderedDict()
-        self.max_size = max_size
-    
-    def get(self, key, default=None):
-        """Get value from cache, moving it to end (most recently used)."""
-        if key in self.cache:
-            # Move to end (most recent)
-            self.cache.move_to_end(key)
-            return self.cache[key]
-        return default
-    
-    def __getitem__(self, key):
-        """Dictionary-style access."""
-        value = self.get(key)
-        if value is None:
-            raise KeyError(key)
-        return value
-    
-    def __contains__(self, key):
-        """Check if key exists in cache."""
-        return key in self.cache
-    
-    def set(self, key, value):
-        """Set value in cache, evicting oldest item if cache is full."""
-        if key in self.cache:
-            # Update existing and move to end
-            self.cache.move_to_end(key)
-        self.cache[key] = value
-        
-        # Evict oldest item if over limit
-        if len(self.cache) > self.max_size:
-            self.cache.popitem(last=False)  # Remove first (oldest) item
-    
-    def __setitem__(self, key, value):
-        """Dictionary-style assignment."""
-        self.set(key, value)
-    
-    def clear(self):
-        """Clear all items from cache."""
-        self.cache.clear()
-    
-    def __len__(self):
-        """Return number of items in cache."""
-        return len(self.cache)
-    
-    def items(self):
-        """Return cache items."""
-        return self.cache.items()
-    
-    def keys(self):
-        """Return cache keys."""
-        return self.cache.keys()
-    
-    def values(self):
-        """Return cache values."""
-        return self.cache.values()
-
-
-# Cache for ChEBI API responses to avoid repeated calls
-# Using LRU cache to prevent unbounded memory growth
-_chebi_children_cache: LRUCache = LRUCache(max_size=200)
-_chebi_parents_cache: LRUCache = LRUCache(max_size=200)
-_chebi_ancestors_cache: LRUCache = LRUCache(max_size=200)
+from .cache_manager import CacheManager, PersistentCache
+from .retry import retry_with_backoff
 
 
 class ChEBIClient:
@@ -105,8 +23,13 @@ class ChEBIClient:
     Supports persistent caching to reduce API calls.
     """
     
-    def __init__(self, base_url: Optional[str] = None, timeout: Optional[int] = None, 
-                 cache_dir: Optional[Path] = None, use_cache: bool = True):
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        timeout: Optional[int] = None,
+        cache_dir: Optional[Path] = None,
+        use_cache: bool = True
+    ):
         """
         Initialize ChEBI API client.
         
@@ -133,27 +56,59 @@ class ChEBIClient:
             project_root = Path(__file__).parent.parent.parent
             self.cache_dir = project_root / 'data' / 'cache'
         
-        self.cache_file = self.cache_dir / 'chebi_children_cache.json'
-        self.parents_cache_file = self.cache_dir / 'chebi_parents_cache.json'
-        self.ancestors_cache_file = self.cache_dir / 'chebi_ancestors_cache.json'
-        
-        # Use global LRU caches for backward compatibility
-        self.cache = _chebi_children_cache
-        self.parents_cache = _chebi_parents_cache
-        self.ancestors_cache = _chebi_ancestors_cache
-        
-        # Track if cache has been modified
-        self._cache_dirty = False
-        self._children_save_counter = 0
-        self._parents_save_counter = 0
-        self._ancestors_save_counter = 0
-        self._save_batch_size = 10  # Save after every N new entries
-        
-        # Load persistent cache if enabled
+        # Initialize cache manager
         if self.use_cache:
-            self._load_cache()
-            self._load_parents_cache()
-            self._load_ancestors_cache()
+            self.cache_manager = CacheManager(self.cache_dir)
+            self.children_cache = self.cache_manager.register_cache(
+                'chebi_children_cache',
+                cache_file=self.cache_dir / 'chebi_children_cache.json'
+            )
+            self.parents_cache = self.cache_manager.register_cache(
+                'chebi_parents_cache',
+                cache_file=self.cache_dir / 'chebi_parents_cache.json'
+            )
+            self.ancestors_cache = self.cache_manager.register_cache(
+                'chebi_ancestors_cache',
+                cache_file=self.cache_dir / 'chebi_ancestors_cache.json'
+            )
+        else:
+            self.cache_manager = None
+            self.children_cache = None
+            self.parents_cache = None
+            self.ancestors_cache = None
+    
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        exceptions=(requests.exceptions.Timeout, requests.exceptions.RequestException)
+    )
+    def _fetch_children(self, chebi_id: int) -> List[Dict[str, Any]]:
+        """
+        Fetch children from ChEBI API with retry logic.
+        
+        Parameters:
+        -----------
+        chebi_id : int
+            ChEBI ID (without 'CHEBI:' prefix)
+        
+        Returns:
+        --------
+        list of dict
+            List of direct children with 'is a' relationship
+        """
+        url = f'{self.base_url}/ontology/children/{chebi_id}/'
+        response = requests.get(url, headers={'accept': '*/*'}, timeout=self.timeout)
+        
+        if response.status_code != 200:
+            logger.warning(f"ChEBI API failed for {chebi_id}: HTTP {response.status_code}")
+            return []
+        
+        data = response.json()
+        incoming = data.get('ontology_relations', {}).get('incoming_relations', [])
+        
+        # Filter for "is a" relations (direct children)
+        children = [rel for rel in incoming if rel.get('relation_type') == 'is a']
+        return children
     
     def get_children(self, chebi_id: int) -> List[Dict[str, Any]]:
         """
@@ -177,50 +132,58 @@ class ChEBIClient:
         >>> print(len(children))
         """
         # Check cache first
-        if chebi_id in self.cache:
+        if self.use_cache and chebi_id in self.children_cache:
             logger.debug(f"Cache hit for ChEBI children: {chebi_id}")
-            return self.cache[chebi_id]
+            return self.children_cache[chebi_id]
         
         logger.debug(f"Fetching ChEBI children for {chebi_id}")
+        
         try:
-            url = f'{self.base_url}/ontology/children/{chebi_id}/'
-            response = requests.get(url, headers={'accept': '*/*'}, timeout=self.timeout)
-            
-            if response.status_code != 200:
-                logger.warning(f"ChEBI API failed for {chebi_id}: HTTP {response.status_code}")
-                # Don't cache failures - allow retry on next call
-                return []
-            
-            data = response.json()
-            incoming = data.get('ontology_relations', {}).get('incoming_relations', [])
-            
-            # Filter for "is a" relations (direct children)
-            children = [rel for rel in incoming if rel.get('relation_type') == 'is a']
+            children = self._fetch_children(chebi_id)
             logger.debug(f"Found {len(children)} children for ChEBI {chebi_id}")
             
-            self.cache[chebi_id] = children
-            self._cache_dirty = True
-            self._children_save_counter += 1
-            
-            # Save all caches periodically (batch saves)
-            if self.use_cache and self._children_save_counter >= self._save_batch_size:
-                self.save_cache()  # Save all caches together
-                self._children_save_counter = 0
+            # Cache the result
+            if self.use_cache and children:  # Only cache non-empty results
+                self.children_cache[chebi_id] = children
             
             return children
             
-        except requests.exceptions.Timeout as e:
-            logger.error(f"Timeout fetching ChEBI children for {chebi_id}: {str(e)}")
-            # Don't cache errors - allow retry
-            return []
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error fetching ChEBI children for {chebi_id}: {str(e)}")
-            # Don't cache errors - allow retry
-            return []
         except Exception as e:
-            logger.exception(f"Unexpected error fetching ChEBI children for {chebi_id}: {str(e)}")
-            # Don't cache errors - allow retry
+            logger.error(f"Error fetching ChEBI children for {chebi_id}: {str(e)}")
             return []
+    
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=1.0,
+        exceptions=(requests.exceptions.Timeout, requests.exceptions.RequestException)
+    )
+    def _fetch_parents(self, chebi_id: int) -> List[Dict[str, Any]]:
+        """
+        Fetch parents from ChEBI API with retry logic.
+        
+        Parameters:
+        -----------
+        chebi_id : int
+            ChEBI ID (without 'CHEBI:' prefix)
+        
+        Returns:
+        --------
+        list of dict
+            List of direct parents with 'is a' relationship
+        """
+        url = f'{self.base_url}/ontology/parents/{chebi_id}/'
+        response = requests.get(url, headers={'accept': '*/*'}, timeout=self.timeout)
+        
+        if response.status_code != 200:
+            logger.warning(f"ChEBI API failed for {chebi_id}: HTTP {response.status_code}")
+            return []
+        
+        data = response.json()
+        outgoing = data.get('ontology_relations', {}).get('outgoing_relations', [])
+        
+        # Filter for "is a" relations (direct parents)
+        parents = [rel for rel in outgoing if rel.get('relation_type') == 'is a']
+        return parents
     
     def get_parents(self, chebi_id: int) -> List[Dict[str, Any]]:
         """
@@ -244,49 +207,24 @@ class ChEBIClient:
         >>> print(parents)
         """
         # Check cache first
-        if chebi_id in self.parents_cache:
+        if self.use_cache and chebi_id in self.parents_cache:
             logger.debug(f"Cache hit for ChEBI parents: {chebi_id}")
             return self.parents_cache[chebi_id]
         
         logger.debug(f"Fetching ChEBI parents for {chebi_id}")
+        
         try:
-            url = f'{self.base_url}/ontology/parents/{chebi_id}/'
-            response = requests.get(url, headers={'accept': '*/*'}, timeout=self.timeout)
-            
-            if response.status_code != 200:
-                logger.warning(f"ChEBI API failed for {chebi_id}: HTTP {response.status_code}")
-                # Don't cache failures - allow retry on next call
-                return []
-            
-            data = response.json()
-            outgoing = data.get('ontology_relations', {}).get('outgoing_relations', [])
-            
-            # Filter for "is a" relations (direct parents)
-            parents = [rel for rel in outgoing if rel.get('relation_type') == 'is a']
+            parents = self._fetch_parents(chebi_id)
             logger.debug(f"Found {len(parents)} parents for ChEBI {chebi_id}")
             
-            self.parents_cache[chebi_id] = parents
-            self._cache_dirty = True
-            self._parents_save_counter += 1
-            
-            # Save all caches periodically (batch saves)
-            if self.use_cache and self._parents_save_counter >= self._save_batch_size:
-                self.save_cache()  # Save all caches together
-                self._parents_save_counter = 0
+            # Cache the result
+            if self.use_cache and parents:  # Only cache non-empty results
+                self.parents_cache[chebi_id] = parents
             
             return parents
             
-        except requests.exceptions.Timeout as e:
-            logger.error(f"Timeout fetching ChEBI parents for {chebi_id}: {str(e)}")
-            # Don't cache errors - allow retry
-            return []
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error fetching ChEBI parents for {chebi_id}: {str(e)}")
-            # Don't cache errors - allow retry
-            return []
         except Exception as e:
-            logger.exception(f"Unexpected error fetching ChEBI parents for {chebi_id}: {str(e)}")
-            # Don't cache errors - allow retry
+            logger.error(f"Error fetching ChEBI parents for {chebi_id}: {str(e)}")
             return []
     
     def get_all_ancestors(self, chebi_id: int, max_depth: int = 20) -> List[int]:
@@ -313,7 +251,7 @@ class ChEBIClient:
         True
         """
         # Check cache first
-        if chebi_id in self.ancestors_cache:
+        if self.use_cache and chebi_id in self.ancestors_cache:
             logger.debug(f"Cache hit for ChEBI ancestors: {chebi_id}")
             return self.ancestors_cache[chebi_id]
         
@@ -344,14 +282,10 @@ class ChEBIClient:
             
             ancestor_list = sorted(list(ancestors))
             logger.debug(f"Found {len(ancestor_list)} ancestors for ChEBI {chebi_id}")
-            self.ancestors_cache[chebi_id] = ancestor_list
-            self._cache_dirty = True
-            self._ancestors_save_counter += 1
             
-            # Save all caches periodically (batch saves)
-            if self.use_cache and self._ancestors_save_counter >= self._save_batch_size:
-                self.save_cache()  # Save all caches together
-                self._ancestors_save_counter = 0
+            # Cache the result
+            if self.use_cache:
+                self.ancestors_cache[chebi_id] = ancestor_list
             
             return ancestor_list
             
@@ -399,158 +333,20 @@ class ChEBIClient:
         
         return main_groups
     
-    def clear_cache(self) -> None:
-        """Clear the ChEBI children cache."""
-        self.cache.clear()
-    
-    def _load_cache(self) -> None:
-        """
-        Load cache from disk if it exists.
-        
-        The cache is stored as JSON with ChEBI IDs as string keys
-        (JSON doesn't support integer keys).
-        """
-        if not self.cache_file.exists():
-            return
-        
-        try:
-            with open(self.cache_file, 'r', encoding='utf-8') as f:
-                cache_data = json.load(f)
-            
-            # Convert string keys back to integers and load into LRU cache
-            # Only load non-empty results (don't load cached failures)
-            for key_str, value in cache_data.items():
-                if value:  # Skip empty lists
-                    self.cache.set(int(key_str), value)
-            
-            print(f"Loaded ChEBI children cache with {len(self.cache)} entries")
-        except Exception as e:
-            print(f"Warning: Failed to load ChEBI children cache: {str(e)}")
-    
-    def _load_parents_cache(self) -> None:
-        """Load parents cache from disk if it exists."""
-        if not self.parents_cache_file.exists():
-            return
-        
-        try:
-            with open(self.parents_cache_file, 'r', encoding='utf-8') as f:
-                cache_data = json.load(f)
-            
-            # Convert string keys back to integers and load into LRU cache
-            # Only load non-empty results (don't load cached failures)
-            for key_str, value in cache_data.items():
-                if value:  # Skip empty lists
-                    self.parents_cache.set(int(key_str), value)
-            
-            print(f"Loaded ChEBI parents cache with {len(self.parents_cache)} entries")
-        except Exception as e:
-            print(f"Warning: Failed to load ChEBI parents cache: {str(e)}")
-    
-    def _load_ancestors_cache(self) -> None:
-        """Load ancestors cache from disk if it exists."""
-        if not self.ancestors_cache_file.exists():
-            return
-        
-        try:
-            with open(self.ancestors_cache_file, 'r', encoding='utf-8') as f:
-                cache_data = json.load(f)
-            
-            # Convert string keys back to integers and load into LRU cache
-            # Only load non-empty results (don't load cached failures)
-            for key_str, value in cache_data.items():
-                if value:  # Skip empty lists
-                    self.ancestors_cache.set(int(key_str), value)
-            
-            print(f"Loaded ChEBI ancestors cache with {len(self.ancestors_cache)} entries")
-        except Exception as e:
-            print(f"Warning: Failed to load ChEBI ancestors cache: {str(e)}")
-    
-    def _save_cache(self) -> None:
-        """Save children cache to disk in JSON format."""
-        if not self.use_cache:
-            return
-        
-        try:
-            # Create cache directory if it doesn't exist
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Convert integer keys to strings for JSON
-            # Only save non-empty results (don't persist failures)
-            cache_data = {str(key): value for key, value in self.cache.items() if value}
-            
-            # Write to temporary file first, then rename for atomicity
-            temp_file = self.cache_file.with_suffix('.tmp')
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, indent=2, ensure_ascii=False)
-            
-            # Atomic rename
-            temp_file.replace(self.cache_file)
-            
-            print(f"Saved ChEBI children cache with {len(self.cache)} entries")
-        except Exception as e:
-            print(f"Warning: Failed to save ChEBI children cache: {str(e)}")
-    
-    def _save_parents_cache(self) -> None:
-        """Save parents cache to disk in JSON format."""
-        if not self.use_cache:
-            return
-        
-        try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            # Only save non-empty results (don't persist failures)
-            cache_data = {str(key): value for key, value in self.parents_cache.items() if value}
-            
-            temp_file = self.parents_cache_file.with_suffix('.tmp')
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, indent=2, ensure_ascii=False)
-            
-            temp_file.replace(self.parents_cache_file)
-            print(f"Saved ChEBI parents cache with {len(self.parents_cache)} entries")
-        except Exception as e:
-            print(f"Warning: Failed to save ChEBI parents cache: {str(e)}")
-    
-    def _save_ancestors_cache(self) -> None:
-        """Save ancestors cache to disk in JSON format."""
-        if not self.use_cache:
-            return
-        
-        try:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            # Only save non-empty results (don't persist failures)
-            cache_data = {str(key): value for key, value in self.ancestors_cache.items() if value}
-            
-            temp_file = self.ancestors_cache_file.with_suffix('.tmp')
-            with open(temp_file, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, indent=2, ensure_ascii=False)
-            
-            temp_file.replace(self.ancestors_cache_file)
-            print(f"Saved ChEBI ancestors cache with {len(self.ancestors_cache)} entries")
-        except Exception as e:
-            print(f"Warning: Failed to save ChEBI ancestors cache: {str(e)}")
-    
     def save_cache(self) -> None:
-        """
-        Manually save all caches to disk.
-        
-        This is called automatically in batches and on cleanup,
-        but can be called manually to ensure data is persisted.
-        """
-        self._save_cache()
-        self._save_parents_cache()
-        self._save_ancestors_cache()
-        self._cache_dirty = False  # Reset after saving all caches
+        """Manually save all caches to disk."""
+        if self.use_cache and self.cache_manager:
+            self.cache_manager.save_all()
+    
+    def clear_cache(self) -> None:
+        """Clear all caches."""
+        if self.use_cache and self.cache_manager:
+            self.cache_manager.clear_all()
     
     def __del__(self):
-        """
-        Destructor to save all caches when object is garbage collected.
-        
-        This ensures that any pending cache updates are saved even
-        if save_cache() wasn't called explicitly.
-        """
-        if self.use_cache and self._cache_dirty:
-            self._save_cache()
-            self._save_parents_cache()
-            self._save_ancestors_cache()
+        """Destructor to save caches when object is garbage collected."""
+        if self.use_cache and self.cache_manager:
+            self.cache_manager.save_all()
 
 
 # =============================================================================
